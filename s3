@@ -1,0 +1,79 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'WordPress Files and Backup S3 Bucket - Free Tier Compatible'
+
+Parameters:
+  BucketRegion:
+    Type: String
+    Default: 'us-east-1'
+    Description: 'Region where the bucket will be created (should match your EC2 region)'
+    AllowedValues:
+      - 'us-east-1'
+      - 'us-east-2'
+      - 'us-west-1'
+      - 'us-west-2'
+
+Resources:
+  WordPressStorageBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: wordpress-storage-2024-free
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Suspended  # Changed from 'Disabled' to 'Suspended'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: Purpose
+          Value: WordPressBackup
+
+  WordPressBackupBucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: !Ref WordPressStorageBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowSpecificIPAccess
+            Effect: Allow
+            Principal: '*'
+            Action:
+              - 's3:GetObject'
+              - 's3:PutObject'
+              - 's3:ListBucket'
+            Resource: 
+              - !Sub 'arn:aws:s3:::${WordPressStorageBucket}/*'
+              - !Sub 'arn:aws:s3:::${WordPressStorageBucket}'
+            Condition:
+              IpAddress:
+                aws:SourceIp:
+                  - '94.72.132.203'  # Replace with your IP address
+
+Outputs:
+  BackupBucketName:
+    Description: Name of the S3 bucket for WordPress backups
+    Value: !Ref WordPressStorageBucket
+
+  BackupBucketDomainName:
+    Description: Domain name of the S3 bucket
+    Value: !GetAtt WordPressStorageBucket.DomainName
+
+  S3BackupCommands:
+    Description: Basic S3 backup commands
+    Value: !Sub |
+      # Create WordPress backup:
+      tar -czf wordpress-backup.tar.gz /var/www/html/wp-content
+      mysqldump --no-tablespaces -u [USER] -p [DATABASE] > database.sql
+
+      # Upload to S3:
+      aws s3 cp wordpress-backup.tar.gz s3://${WordPressStorageBucket}/wordpress-backup.tar.gz
+      aws s3 cp database.sql s3://${WordPressStorageBucket}/database.sql
+
+      # Download from S3:
+      aws s3 cp s3://${WordPressStorageBucket}/wordpress-backup.tar.gz ./wordpress-backup.tar.gz
+      aws s3 cp s3://${WordPressStorageBucket}/database.sql ./database.sql
