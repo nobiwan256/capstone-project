@@ -1,0 +1,135 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'EC2 Infrastructure for WordPress with Auto Scaling'
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: WordPress
+
+Resources:
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP from ALB and SSH access from specific IP
+      VpcId: 
+        Fn::ImportValue: !Sub ${EnvironmentName}-VPCID
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: 
+            Fn::ImportValue: !Sub ${EnvironmentName}-ALBSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 149.224.62.231/32
+
+  WordPressLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub ${AWS::StackName}-launch-template
+      LaunchTemplateData:
+        ImageId: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+        InstanceType: t2.micro
+        SecurityGroupIds: 
+          - !Ref EC2SecurityGroup
+        KeyName: projectkey
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash -xe
+            
+            # Database configuration
+            ACTIVE_DB="${Fn::ImportValue: ${EnvironmentName}-ActiveDBEndpoint}"
+            STANDBY_DB="${Fn::ImportValue: ${EnvironmentName}-StandbyDBEndpoint}"
+            DB_USER="wordpress"
+            DB_PASS="wordpress123"
+            DB_NAME="wordpress"
+
+            # Install required packages
+            yum update -y
+            yum install -y httpd wget mysql jq
+            amazon-linux-extras enable php7.4
+            yum clean metadata
+            yum install -y php php-mysqlnd
+            
+            # Start Apache
+            systemctl start httpd
+            systemctl enable httpd
+            
+            # Download and configure WordPress
+            wget https://wordpress.org/latest.tar.gz
+            tar -xzf latest.tar.gz
+            cp -r wordpress/* /var/www/html/
+            
+            # Create wp-config.php
+            cat > /var/www/html/wp-config.php <<EOF
+            <?php
+            define( 'DB_NAME', '$DB_NAME' );
+            define( 'DB_USER', '$DB_USER' );
+            define( 'DB_PASSWORD', '$DB_PASS' );
+            define( 'DB_HOST', '$ACTIVE_DB' );
+            define( 'DB_CHARSET', 'utf8' );
+            define( 'DB_COLLATE', '' );
+            
+            $(curl -s https://api.wordpress.org/secret-key/1.1/salt/)
+            
+            \$table_prefix = 'wp_';
+            define( 'WP_DEBUG', false );
+            if ( ! defined( 'ABSPATH' ) ) {
+              define( 'ABSPATH', __DIR__ . '/' );
+            }
+            require_once ABSPATH . 'wp-settings.php';
+            EOF
+            
+            # Set permissions
+            chown -R apache:apache /var/www/html
+            chmod 2775 /var/www/html
+            find /var/www/html -type d -exec chmod 2775 {} \;
+            find /var/www/html -type f -exec chmod 0664 {} \;
+            
+            # Restart Apache
+            systemctl restart httpd
+
+  WordPressASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub ${AWS::StackName}-asg
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WordPressLaunchTemplate
+        Version: !GetAtt WordPressLaunchTemplate.LatestVersionNumber
+      MinSize: 1
+      MaxSize: 2
+      DesiredCapacity: 1
+      TargetGroupARNs:
+        - Fn::ImportValue: !Sub ${EnvironmentName}-TargetGroup
+      VPCZoneIdentifier:
+        - Fn::ImportValue: !Sub ${EnvironmentName}-PublicSubnet1
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      Tags:
+        - Key: Name
+          Value: WordPress-ASG-Instance
+          PropagateAtLaunch: true
+
+  ScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref WordPressASG
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 70.0
+
+Outputs:
+  AutoScalingGroupName:
+    Description: Auto Scaling Group Name
+    Value: !Ref WordPressASG
+    Export:
+      Name: !Sub ${EnvironmentName}-ASGName
+
+  EC2SecurityGroup:
+    Description: EC2 Security Group ID
+    Value: !Ref EC2SecurityGroup
+    Export:
+      Name: !Sub ${EnvironmentName}-EC2SecurityGroup
