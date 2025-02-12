@@ -1,0 +1,134 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'WordPress deployment on EC2 with Amazon Linux 2 and MariaDB'
+
+Parameters:
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+  PublicSubnet:
+    Type: AWS::EC2::Subnet::Id
+    Description: Select the public subnet for the EC2 instance
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Select the VPC
+
+Resources:
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP and SSH access
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t2.micro
+      ImageId: !Ref LatestAmiId
+      KeyName: projectkey
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds: 
+        - !Ref EC2SecurityGroup
+      Tags:
+        - Key: Name
+          Value: WordPress-EC2-MariaDB
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash -xe
+          
+          # Enable logging
+          exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+
+          # Database credentials
+          DB_NAME="wordpress_db"
+          DB_USER="wordpress_user"
+          DB_PASSWORD="wordpress123"  # Changed to a fixed password for testing
+          DB_HOST="localhost"
+          
+          # Update system
+          yum update -y
+          
+          # Install required packages
+          yum install -y httpd mariadb mariadb-server
+          amazon-linux-extras enable php7.4
+          yum clean metadata
+          yum install -y php php-mysqlnd
+          
+          # Start services
+          systemctl start httpd
+          systemctl enable httpd
+          systemctl start mariadb
+          systemctl enable mariadb
+          
+          # Wait for MariaDB to be ready
+          while ! mysqladmin ping -s; do
+            sleep 3
+          done
+          
+          # Set up MariaDB root password and create database
+          mysqladmin -u root password "$DB_PASSWORD"
+          
+          # Create database and user
+          mysql -u root -p"$DB_PASSWORD" <<MYSQL_SCRIPT
+          CREATE DATABASE $DB_NAME;
+          CREATE USER '$DB_USER'@'localhost' IDENTIFIED BY '$DB_PASSWORD';
+          GRANT ALL PRIVILEGES ON $DB_NAME.* TO '$DB_USER'@'localhost';
+          FLUSH PRIVILEGES;
+          MYSQL_SCRIPT
+          
+          # Download and configure WordPress
+          wget https://wordpress.org/latest.tar.gz
+          tar -xzf latest.tar.gz
+          cp -r wordpress/* /var/www/html/
+          
+          # Create wp-config.php
+          cat > /var/www/html/wp-config.php <<EOF
+          <?php
+          define( 'DB_NAME', '$DB_NAME' );
+          define( 'DB_USER', '$DB_USER' );
+          define( 'DB_PASSWORD', '$DB_PASSWORD' );
+          define( 'DB_HOST', '$DB_HOST' );
+          define( 'DB_CHARSET', 'utf8' );
+          define( 'DB_COLLATE', '' );
+          
+          $(curl -s https://api.wordpress.org/secret-key/1.1/salt/)
+          
+          \$table_prefix = 'wp_';
+          define( 'WP_DEBUG', false );
+          if ( ! defined( 'ABSPATH' ) ) {
+            define( 'ABSPATH', __DIR__ . '/' );
+          }
+          require_once ABSPATH . 'wp-settings.php';
+          EOF
+          
+          # Set permissions
+          usermod -a -G apache ec2-user
+          chown -R apache:apache /var/www
+          chmod 2775 /var/www
+          find /var/www -type d -exec chmod 2775 {} \;
+          find /var/www -type f -exec chmod 0664 {} \;
+          
+          # Restart services
+          systemctl restart httpd
+          systemctl restart mariadb
+          
+          # Save database info
+          echo "WordPress Database: $DB_NAME" > /root/wordpress-info.txt
+          echo "WordPress User: $DB_USER" >> /root/wordpress-info.txt
+          echo "WordPress Password: $DB_PASSWORD" >> /root/wordpress-info.txt
+
+Outputs:
+  WebsiteURL:
+    Description: WordPress Website URL
+    Value: !Sub http://${EC2Instance.PublicDnsName}
+  SSHCommand:
+    Description: SSH Command
+    Value: !Sub ssh -i projectkey.pem ec2-user@${EC2Instance.PublicDnsName}
