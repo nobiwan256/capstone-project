@@ -1,66 +1,31 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'WordPress with Active-Standby RDS Configuration'
+Description: 'RDS Infrastructure for WordPress'
 
 Parameters:
-  LatestAmiId:
-    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
-    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
-  PublicSubnet:
-    Type: AWS::EC2::Subnet::Id
-    Description: Select the public subnet for the EC2 instance
-  PrivateSubnet1:
-    Type: AWS::EC2::Subnet::Id
-    Description: First private subnet for active RDS (AZ1)
-  PrivateSubnet2:
-    Type: AWS::EC2::Subnet::Id
-    Description: Second private subnet for standby RDS (AZ2)
-  VpcId:
-    Type: AWS::EC2::VPC::Id
-    Description: Select the VPC
+  EnvironmentName:
+    Type: String
+    Default: WordPress
 
 Resources:
-  # Replace the DBSubnetGroup1 and DBSubnetGroup2 resources with this:
-  DBSubnetGroup1:
+  DBSubnetGroup:
     Type: AWS::RDS::DBSubnetGroup
     Properties:
-      DBSubnetGroupDescription: Subnet group for Active RDS
+      DBSubnetGroupDescription: Subnet group for WordPress RDS
       SubnetIds:
-        - !Ref PrivateSubnet1
-        - !Ref PrivateSubnet2
-
-  DBSubnetGroup2:
-    Type: AWS::RDS::DBSubnetGroup
-    Properties:
-      DBSubnetGroupDescription: Subnet group for Standby RDS
-      SubnetIds:
-        - !Ref PrivateSubnet1
-        - !Ref PrivateSubnet2
+        - Fn::ImportValue: !Sub ${EnvironmentName}-PrivateSubnet1
+        - Fn::ImportValue: !Sub ${EnvironmentName}-PrivateSubnet2
 
   DBSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupDescription: Allow MySQL access from EC2
-      VpcId: !Ref VpcId
+      VpcId: 
+        Fn::ImportValue: !Sub ${EnvironmentName}-VPCID
       SecurityGroupIngress:
         - IpProtocol: tcp
           FromPort: 3306
           ToPort: 3306
           SourceSecurityGroupId: !Ref EC2SecurityGroup
-
-  EC2SecurityGroup:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupDescription: Allow HTTP and SSH access
-      VpcId: !Ref VpcId
-      SecurityGroupIngress:
-        - IpProtocol: tcp
-          FromPort: 80
-          ToPort: 80
-          CidrIp: 0.0.0.0/0
-        - IpProtocol: tcp
-          FromPort: 22
-          ToPort: 22
-          CidrIp: 0.0.0.0/0
 
   ActiveDB:
     Type: AWS::RDS::DBInstance
@@ -74,7 +39,7 @@ Resources:
       AllocatedStorage: '20'
       VPCSecurityGroups:
         - !Ref DBSecurityGroup
-      DBSubnetGroupName: !Ref DBSubnetGroup1
+      DBSubnetGroupName: !Ref DBSubnetGroup
       PubliclyAccessible: false
       MultiAZ: false
       BackupRetentionPeriod: 1
@@ -92,142 +57,27 @@ Resources:
       AllocatedStorage: '20'
       VPCSecurityGroups:
         - !Ref DBSecurityGroup
-      DBSubnetGroupName: !Ref DBSubnetGroup2
+      DBSubnetGroupName: !Ref DBSubnetGroup
       PubliclyAccessible: false
       MultiAZ: false
       BackupRetentionPeriod: 1
       DeletionProtection: false
 
-  EC2Instance:
-    Type: AWS::EC2::Instance
-    Properties:
-      InstanceType: t2.micro
-      ImageId: !Ref LatestAmiId
-      KeyName: projectkey
-      SubnetId: !Ref PublicSubnet
-      SecurityGroupIds: 
-        - !Ref EC2SecurityGroup
-      Tags:
-        - Key: Name
-          Value: WordPress-EC2
-      UserData:
-        Fn::Base64: !Sub |
-          #!/bin/bash -xe
-          
-          # Enable logging
-          exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
-
-          # Database configuration
-          ACTIVE_DB="${ActiveDB.Endpoint.Address}"
-          STANDBY_DB="${StandbyDB.Endpoint.Address}"
-          DB_USER="wordpress"
-          DB_PASS="wordpress123"
-          DB_NAME="wordpress"
-
-          # Install required packages
-          yum update -y
-          yum install -y httpd wget mysql jq
-          amazon-linux-extras enable php7.4
-          yum clean metadata
-          yum install -y php php-mysqlnd
-          
-          # Start Apache
-          systemctl start httpd
-          systemctl enable httpd
-          
-          # Create health check script
-          cat > /usr/local/bin/check-db.sh <<'EOF'
-          #!/bin/bash
-          ACTIVE_DB="${ActiveDB.Endpoint.Address}"
-          STANDBY_DB="${StandbyDB.Endpoint.Address}"
-          DB_USER="wordpress"
-          DB_PASS="wordpress123"
-
-          # Check Active DB
-          if mysql -h $ACTIVE_DB -u $DB_USER -p$DB_PASS -e "SELECT 1" &>/dev/null; then
-              CURRENT_DB=$ACTIVE_DB
-          else
-              # Failover to Standby
-              if mysql -h $STANDBY_DB -u $DB_USER -p$DB_PASS -e "SELECT 1" &>/dev/null; then
-                  CURRENT_DB=$STANDBY_DB
-                  echo "Failover to standby database"
-              else
-                  echo "Both databases are unavailable!"
-                  exit 1
-              fi
-          fi
-
-          # Update WordPress configuration
-          sed -i "s/define( *'DB_HOST'.*/define( 'DB_HOST', '$CURRENT_DB' );/" /var/www/html/wp-config.php
-          EOF
-
-          chmod +x /usr/local/bin/check-db.sh
-
-          # Add to crontab
-          echo "*/1 * * * * /usr/local/bin/check-db.sh" | crontab -
-
-          # Download and configure WordPress
-          wget https://wordpress.org/latest.tar.gz
-          tar -xzf latest.tar.gz
-          cp -r wordpress/* /var/www/html/
-          
-          # Create wp-config.php
-          cat > /var/www/html/wp-config.php <<EOF
-          <?php
-          define( 'DB_NAME', '$DB_NAME' );
-          define( 'DB_USER', '$DB_USER' );
-          define( 'DB_PASSWORD', '$DB_PASS' );
-          define( 'DB_HOST', '$ACTIVE_DB' );
-          define( 'DB_CHARSET', 'utf8' );
-          define( 'DB_COLLATE', '' );
-          
-          $(curl -s https://api.wordpress.org/secret-key/1.1/salt/)
-          
-          \$table_prefix = 'wp_';
-          define( 'WP_DEBUG', false );
-          if ( ! defined( 'ABSPATH' ) ) {
-            define( 'ABSPATH', __DIR__ . '/' );
-          }
-          require_once ABSPATH . 'wp-settings.php';
-          EOF
-          
-          # Set up database replication script
-          cat > /usr/local/bin/sync-db.sh <<'EOF'
-          #!/bin/bash
-          ACTIVE_DB="${ActiveDB.Endpoint.Address}"
-          STANDBY_DB="${StandbyDB.Endpoint.Address}"
-          DB_USER="wordpress"
-          DB_PASS="wordpress123"
-          DB_NAME="wordpress"
-
-          # Dump from active and restore to standby
-          mysqldump -h $ACTIVE_DB -u $DB_USER -p$DB_PASS $DB_NAME | mysql -h $STANDBY_DB -u $DB_USER -p$DB_PASS $DB_NAME
-          EOF
-
-          chmod +x /usr/local/bin/sync-db.sh
-
-          # Add database sync to crontab (every 5 minutes)
-          echo "*/5 * * * * /usr/local/bin/sync-db.sh" | crontab -l | sort -u | crontab -
-          
-          # Set permissions
-          chown -R apache:apache /var/www/html
-          chmod 2775 /var/www/html
-          find /var/www/html -type d -exec chmod 2775 {} \;
-          find /var/www/html -type f -exec chmod 0664 {} \;
-          
-          # Restart Apache
-          systemctl restart httpd
-
 Outputs:
-  WebsiteURL:
-    Description: WordPress Website URL
-    Value: !Sub http://${EC2Instance.PublicDnsName}
   ActiveDBEndpoint:
     Description: Active RDS Endpoint
     Value: !GetAtt ActiveDB.Endpoint.Address
+    Export:
+      Name: !Sub ${EnvironmentName}-ActiveDBEndpoint
+
   StandbyDBEndpoint:
     Description: Standby RDS Endpoint
     Value: !GetAtt StandbyDB.Endpoint.Address
-  SSHCommand:
-    Description: SSH Command
-    Value: !Sub ssh -i projectkey.pem ec2-user@${EC2Instance.PublicDnsName}
+    Export:
+      Name: !Sub ${EnvironmentName}-StandbyDBEndpoint
+
+  DBSecurityGroup:
+    Description: Database Security Group
+    Value: !Ref DBSecurityGroup
+    Export:
+      Name: !Sub ${EnvironmentName}-DBSecurityGroup
