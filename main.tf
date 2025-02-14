@@ -1,8 +1,3 @@
-# Define the AWS provider
-provider "aws" {
-  region = "us-east-1"  # Change to your AWS region if needed
-}
-
 # ==============
 # 🚀 NETWORK SETUP
 # ==============
